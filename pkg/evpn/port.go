@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"log"
 	"path"
+	"sort"
 
-	"github.com/vishvananda/netlink"
+	"github.com/google/uuid"
+	// "github.com/vishvananda/netlink"
 
 	pb "github.com/opiproject/opi-api/network/evpn-gw/v1alpha1/gen/go"
 
@@ -21,9 +23,14 @@ import (
 	"go.einride.tech/aip/resourcename"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+func sortBridgePorts(ports []*pb.BridgePort) {
+	sort.Slice(ports, func(i int, j int) bool {
+		return ports[i].Name < ports[j].Name
+	})
+}
 
 // CreateBridgePort executes the creation of the port
 func (s *Server) CreateBridgePort(_ context.Context, in *pb.CreateBridgePortRequest) (*pb.BridgePort, error) {
@@ -59,14 +66,16 @@ func (s *Server) CreateBridgePort(_ context.Context, in *pb.CreateBridgePortRequ
 		return nil, status.Errorf(codes.InvalidArgument, msg)
 	}
 	// not found, so create a new one
-	bridge, err := netlink.LinkByName(tenantbridgeName)
+	bridge, err := s.nLink.LinkByName(tenantbridgeName)
 	if err != nil {
 		err := status.Errorf(codes.NotFound, "unable to find key %s", tenantbridgeName)
 		log.Printf("error: %v", err)
 		return nil, err
 	}
 	// get base interface (e.g.: eth2)
-	iface, err := netlink.LinkByName(resourceID)
+	iface, err := s.nLink.LinkByName(resourceID)
+	// TODO: maybe we need to create a new iface here and not rely on existing one ?
+	//		 iface := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: resourceID}}
 	if err != nil {
 		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
 		log.Printf("error: %v", err)
@@ -74,13 +83,13 @@ func (s *Server) CreateBridgePort(_ context.Context, in *pb.CreateBridgePortRequ
 	}
 	// Example: ip link set eth2 addr aa:bb:cc:00:00:41
 	if len(in.BridgePort.Spec.MacAddress) > 0 {
-		if err := netlink.LinkSetHardwareAddr(iface, in.BridgePort.Spec.MacAddress); err != nil {
+		if err := s.nLink.LinkSetHardwareAddr(iface, in.BridgePort.Spec.MacAddress); err != nil {
 			fmt.Printf("Failed to set MAC on link: %v", err)
 			return nil, err
 		}
 	}
 	// Example: ip link set eth2 master br-tenant
-	if err := netlink.LinkSetMaster(iface, bridge); err != nil {
+	if err := s.nLink.LinkSetMaster(iface, bridge); err != nil {
 		fmt.Printf("Failed to add iface to bridge: %v", err)
 		return nil, err
 	}
@@ -98,13 +107,13 @@ func (s *Server) CreateBridgePort(_ context.Context, in *pb.CreateBridgePortRequ
 		switch in.BridgePort.Spec.Ptype {
 		case pb.BridgePortType_ACCESS:
 			// Example: bridge vlan add dev eth2 vid 20 pvid untagged
-			if err := netlink.BridgeVlanAdd(iface, vid, true, true, false, false); err != nil {
+			if err := s.nLink.BridgeVlanAdd(iface, vid, true, true, false, false); err != nil {
 				fmt.Printf("Failed to add vlan to bridge: %v", err)
 				return nil, err
 			}
 		case pb.BridgePortType_TRUNK:
 			// Example: bridge vlan add dev eth2 vid 20
-			if err := netlink.BridgeVlanAdd(iface, vid, false, false, false, false); err != nil {
+			if err := s.nLink.BridgeVlanAdd(iface, vid, false, false, false, false); err != nil {
 				fmt.Printf("Failed to add vlan to bridge: %v", err)
 				return nil, err
 			}
@@ -115,11 +124,11 @@ func (s *Server) CreateBridgePort(_ context.Context, in *pb.CreateBridgePortRequ
 		}
 	}
 	// Example: ip link set eth2 up
-	if err := netlink.LinkSetUp(iface); err != nil {
+	if err := s.nLink.LinkSetUp(iface); err != nil {
 		fmt.Printf("Failed to up iface link: %v", err)
 		return nil, err
 	}
-	response := proto.Clone(in.BridgePort).(*pb.BridgePort)
+	response := protoClone(in.BridgePort)
 	response.Status = &pb.BridgePortStatus{OperStatus: pb.BPOperStatus_BP_OPER_STATUS_UP}
 	s.Ports[in.BridgePort.Name] = response
 	log.Printf("CreateBridgePort: Sending to client: %v", response)
@@ -151,14 +160,14 @@ func (s *Server) DeleteBridgePort(_ context.Context, in *pb.DeleteBridgePortRequ
 	}
 	resourceID := path.Base(iface.Name)
 	// use netlink to find interface
-	dummy, err := netlink.LinkByName(resourceID)
+	dummy, err := s.nLink.LinkByName(resourceID)
 	if err != nil {
 		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
 		log.Printf("error: %v", err)
 		return nil, err
 	}
 	// bring link down
-	if err := netlink.LinkSetDown(dummy); err != nil {
+	if err := s.nLink.LinkSetDown(dummy); err != nil {
 		fmt.Printf("Failed to up link: %v", err)
 		return nil, err
 	}
@@ -172,13 +181,13 @@ func (s *Server) DeleteBridgePort(_ context.Context, in *pb.DeleteBridgePortRequ
 			return nil, err
 		}
 		vid := uint16(bridgeObject.Spec.VlanId)
-		if err := netlink.BridgeVlanDel(dummy, vid, true, true, false, false); err != nil {
+		if err := s.nLink.BridgeVlanDel(dummy, vid, true, true, false, false); err != nil {
 			fmt.Printf("Failed to delete vlan to bridge: %v", err)
 			return nil, err
 		}
 	}
 	// use netlink to delete dummy interface
-	if err := netlink.LinkDel(dummy); err != nil {
+	if err := s.nLink.LinkDel(dummy); err != nil {
 		fmt.Printf("Failed to delete link: %v", err)
 		return nil, err
 	}
@@ -214,7 +223,7 @@ func (s *Server) UpdateBridgePort(_ context.Context, in *pb.UpdateBridgePortRequ
 		return nil, err
 	}
 	resourceID := path.Base(port.Name)
-	iface, err := netlink.LinkByName(resourceID)
+	iface, err := s.nLink.LinkByName(resourceID)
 	if err != nil {
 		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
 		log.Printf("error: %v", err)
@@ -222,11 +231,11 @@ func (s *Server) UpdateBridgePort(_ context.Context, in *pb.UpdateBridgePortRequ
 	}
 	// base := iface.Attrs()
 	// iface.MTU = 1500 // TODO: remove this, just an example
-	if err := netlink.LinkModify(iface); err != nil {
+	if err := s.nLink.LinkModify(iface); err != nil {
 		fmt.Printf("Failed to update link: %v", err)
 		return nil, err
 	}
-	response := proto.Clone(in.BridgePort).(*pb.BridgePort)
+	response := protoClone(in.BridgePort)
 	response.Status = &pb.BridgePortStatus{OperStatus: pb.BPOperStatus_BP_OPER_STATUS_UP}
 	s.Ports[in.BridgePort.Name] = response
 	log.Printf("UpdateBridgePort: Sending to client: %v", response)
@@ -254,7 +263,7 @@ func (s *Server) GetBridgePort(_ context.Context, in *pb.GetBridgePortRequest) (
 		return nil, err
 	}
 	resourceID := path.Base(port.Name)
-	_, err := netlink.LinkByName(resourceID)
+	_, err := s.nLink.LinkByName(resourceID)
 	if err != nil {
 		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
 		log.Printf("error: %v", err)
@@ -262,4 +271,37 @@ func (s *Server) GetBridgePort(_ context.Context, in *pb.GetBridgePortRequest) (
 	}
 	// TODO
 	return &pb.BridgePort{Name: in.Name, Spec: &pb.BridgePortSpec{MacAddress: port.Spec.MacAddress}, Status: &pb.BridgePortStatus{OperStatus: pb.BPOperStatus_BP_OPER_STATUS_UP}}, nil
+}
+
+// ListBridgePorts lists logical bridges
+func (s *Server) ListBridgePorts(_ context.Context, in *pb.ListBridgePortsRequest) (*pb.ListBridgePortsResponse, error) {
+	log.Printf("ListBridgePorts: Received from client: %v", in)
+	// check required fields
+	if err := fieldbehavior.ValidateRequiredFields(in); err != nil {
+		log.Printf("error: %v", err)
+		return nil, err
+	}
+	// fetch pagination from the database, calculate size and offset
+	size, offset, perr := extractPagination(in.PageSize, in.PageToken, s.Pagination)
+	if perr != nil {
+		log.Printf("error: %v", perr)
+		return nil, perr
+	}
+	// fetch object from the database
+	Blobarray := []*pb.BridgePort{}
+	for _, port := range s.Ports {
+		r := protoClone(port)
+		r.Status = &pb.BridgePortStatus{OperStatus: pb.BPOperStatus_BP_OPER_STATUS_UP}
+		Blobarray = append(Blobarray, r)
+	}
+	// sort is needed, since MAP is unsorted in golang, and we might get different results
+	sortBridgePorts(Blobarray)
+	log.Printf("Limiting result len(%d) to [%d:%d]", len(Blobarray), offset, size)
+	Blobarray, hasMoreElements := limitPagination(Blobarray, offset, size)
+	token := ""
+	if hasMoreElements {
+		token = uuid.New().String()
+		s.Pagination[token] = offset + size
+	}
+	return &pb.ListBridgePortsResponse{BridgePorts: Blobarray, NextPageToken: token}, nil
 }

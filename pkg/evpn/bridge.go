@@ -11,8 +11,9 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"path"
+	"sort"
 
+	"github.com/google/uuid"
 	"github.com/vishvananda/netlink"
 
 	pb "github.com/opiproject/opi-api/network/evpn-gw/v1alpha1/gen/go"
@@ -23,9 +24,14 @@ import (
 	"go.einride.tech/aip/resourcename"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
+
+func sortLogicalBridges(bridges []*pb.LogicalBridge) {
+	sort.Slice(bridges, func(i int, j int) bool {
+		return bridges[i].Name < bridges[j].Name
+	})
+}
 
 // CreateLogicalBridge executes the creation of the LogicalBridge
 func (s *Server) CreateLogicalBridge(_ context.Context, in *pb.CreateLogicalBridgeRequest) (*pb.LogicalBridge, error) {
@@ -60,42 +66,42 @@ func (s *Server) CreateLogicalBridge(_ context.Context, in *pb.CreateLogicalBrid
 		return nil, status.Errorf(codes.InvalidArgument, msg)
 	}
 	// create vxlan only if VNI is not empty
-	if in.LogicalBridge.Spec.Vni > 0 {
-		bridge, err := netlink.LinkByName(tenantbridgeName)
+	if in.LogicalBridge.Spec.Vni != nil {
+		bridge, err := s.nLink.LinkByName(tenantbridgeName)
 		if err != nil {
 			err := status.Errorf(codes.NotFound, "unable to find key %s", tenantbridgeName)
 			log.Printf("error: %v", err)
 			return nil, err
 		}
 		// Example: ip link add vxlan-<LB-vlan-id> type vxlan id <LB-vni> local <vtep-ip> dstport 4789 nolearning proxy
-		vxlanName := fmt.Sprintf("vxlan%d", in.LogicalBridge.Spec.VlanId)
 		myip := make(net.IP, 4)
-		// TODO: remove hard-coded 167772260 == "10.0.0.100"
-		binary.BigEndian.PutUint32(myip, 167772260)
-		vxlan := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: vxlanName}, VxlanId: int(in.LogicalBridge.Spec.Vni), Port: 4789, Learning: false, SrcAddr: myip}
+		binary.BigEndian.PutUint32(myip, in.LogicalBridge.Spec.VtepIpPrefix.Addr.GetV4Addr())
+		vxlanName := fmt.Sprintf("vni%d", *in.LogicalBridge.Spec.Vni)
+		vxlan := &netlink.Vxlan{LinkAttrs: netlink.LinkAttrs{Name: vxlanName}, VxlanId: int(*in.LogicalBridge.Spec.Vni), Port: 4789, Learning: false, SrcAddr: myip}
+		log.Printf("Creating Vxlan %v", vxlan)
 		// TODO: take Port from proto instead of hard-coded
-		if err := netlink.LinkAdd(vxlan); err != nil {
+		if err := s.nLink.LinkAdd(vxlan); err != nil {
 			fmt.Printf("Failed to create Vxlan link: %v", err)
 			return nil, err
 		}
 		// Example: ip link set vxlan-<LB-vlan-id> master br-tenant addrgenmode none
-		if err := netlink.LinkSetMaster(vxlan, bridge); err != nil {
+		if err := s.nLink.LinkSetMaster(vxlan, bridge); err != nil {
 			fmt.Printf("Failed to add Vxlan to bridge: %v", err)
 			return nil, err
 		}
 		// Example: ip link set vxlan-<LB-vlan-id> up
-		if err := netlink.LinkSetUp(vxlan); err != nil {
+		if err := s.nLink.LinkSetUp(vxlan); err != nil {
 			fmt.Printf("Failed to up Vxlan link: %v", err)
 			return nil, err
 		}
 		// Example: bridge vlan add dev vxlan-<LB-vlan-id> vid <LB-vlan-id> pvid untagged
-		if err := netlink.BridgeVlanAdd(vxlan, uint16(in.LogicalBridge.Spec.VlanId), true, true, false, false); err != nil {
+		if err := s.nLink.BridgeVlanAdd(vxlan, uint16(in.LogicalBridge.Spec.VlanId), true, true, false, false); err != nil {
 			fmt.Printf("Failed to add vlan to bridge: %v", err)
 			return nil, err
 		}
 		// TODO: bridge link set dev vxlan-<LB-vlan-id> neigh_suppress on
 	}
-	response := proto.Clone(in.LogicalBridge).(*pb.LogicalBridge)
+	response := protoClone(in.LogicalBridge)
 	response.Status = &pb.LogicalBridgeStatus{OperStatus: pb.LBOperStatus_LB_OPER_STATUS_UP}
 	s.Bridges[in.LogicalBridge.Name] = response
 	log.Printf("CreateLogicalBridge: Sending to client: %v", response)
@@ -125,28 +131,32 @@ func (s *Server) DeleteLogicalBridge(_ context.Context, in *pb.DeleteLogicalBrid
 		log.Printf("error: %v", err)
 		return nil, err
 	}
-	resourceID := path.Base(obj.Name)
-	// use netlink to find vxlan device
-	vxlan, err := netlink.LinkByName(resourceID)
-	if err != nil {
-		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
-		log.Printf("error: %v", err)
-		return nil, err
-	}
-	// bring link down
-	if err := netlink.LinkSetDown(vxlan); err != nil {
-		fmt.Printf("Failed to up link: %v", err)
-		return nil, err
-	}
-	// delete bridge vlan
-	if err := netlink.BridgeVlanDel(vxlan, uint16(obj.Spec.VlanId), true, true, false, false); err != nil {
-		fmt.Printf("Failed to delete vlan to bridge: %v", err)
-		return nil, err
-	}
-	// use netlink to delete vxlan device
-	if err := netlink.LinkDel(vxlan); err != nil {
-		fmt.Printf("Failed to delete link: %v", err)
-		return nil, err
+	// only if VNI is not empty
+	if obj.Spec.Vni != nil {
+		// use netlink to find vxlan device
+		vxlanName := fmt.Sprintf("vni%d", *obj.Spec.Vni)
+		vxlan, err := s.nLink.LinkByName(vxlanName)
+		if err != nil {
+			err := status.Errorf(codes.NotFound, "unable to find key %s", vxlanName)
+			log.Printf("error: %v", err)
+			return nil, err
+		}
+		log.Printf("Deleting Vxlan %v", vxlan)
+		// bring link down
+		if err := s.nLink.LinkSetDown(vxlan); err != nil {
+			fmt.Printf("Failed to up link: %v", err)
+			return nil, err
+		}
+		// delete bridge vlan
+		if err := s.nLink.BridgeVlanDel(vxlan, uint16(obj.Spec.VlanId), true, true, false, false); err != nil {
+			fmt.Printf("Failed to delete vlan to bridge: %v", err)
+			return nil, err
+		}
+		// use netlink to delete vxlan device
+		if err := s.nLink.LinkDel(vxlan); err != nil {
+			fmt.Printf("Failed to delete link: %v", err)
+			return nil, err
+		}
 	}
 	// remove from the Database
 	delete(s.Bridges, obj.Name)
@@ -179,20 +189,23 @@ func (s *Server) UpdateLogicalBridge(_ context.Context, in *pb.UpdateLogicalBrid
 		log.Printf("error: %v", err)
 		return nil, err
 	}
-	resourceID := path.Base(bridge.Name)
-	iface, err := netlink.LinkByName(resourceID)
-	if err != nil {
-		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
-		log.Printf("error: %v", err)
-		return nil, err
+	// only if VNI is not empty
+	if bridge.Spec.Vni != nil {
+		vxlanName := fmt.Sprintf("vni%d", *bridge.Spec.Vni)
+		iface, err := s.nLink.LinkByName(vxlanName)
+		if err != nil {
+			err := status.Errorf(codes.NotFound, "unable to find key %s", vxlanName)
+			log.Printf("error: %v", err)
+			return nil, err
+		}
+		// base := iface.Attrs()
+		// iface.MTU = 1500 // TODO: remove this, just an example
+		if err := s.nLink.LinkModify(iface); err != nil {
+			fmt.Printf("Failed to update link: %v", err)
+			return nil, err
+		}
 	}
-	// base := iface.Attrs()
-	// iface.MTU = 1500 // TODO: remove this, just an example
-	if err := netlink.LinkModify(iface); err != nil {
-		fmt.Printf("Failed to update link: %v", err)
-		return nil, err
-	}
-	response := proto.Clone(in.LogicalBridge).(*pb.LogicalBridge)
+	response := protoClone(in.LogicalBridge)
 	response.Status = &pb.LogicalBridgeStatus{OperStatus: pb.LBOperStatus_LB_OPER_STATUS_UP}
 	s.Bridges[in.LogicalBridge.Name] = response
 	log.Printf("UpdateLogicalBridge: Sending to client: %v", response)
@@ -219,13 +232,49 @@ func (s *Server) GetLogicalBridge(_ context.Context, in *pb.GetLogicalBridgeRequ
 		log.Printf("error: %v", err)
 		return nil, err
 	}
-	resourceID := path.Base(bridge.Name)
-	_, err := netlink.LinkByName(resourceID)
-	if err != nil {
-		err := status.Errorf(codes.NotFound, "unable to find key %s", resourceID)
-		log.Printf("error: %v", err)
-		return nil, err
+	// only if VNI is not empty
+	if bridge.Spec.Vni != nil {
+		vxlanName := fmt.Sprintf("vni%d", *bridge.Spec.Vni)
+		_, err := s.nLink.LinkByName(vxlanName)
+		if err != nil {
+			err := status.Errorf(codes.NotFound, "unable to find key %s", vxlanName)
+			log.Printf("error: %v", err)
+			return nil, err
+		}
 	}
 	// TODO
 	return &pb.LogicalBridge{Name: in.Name, Spec: &pb.LogicalBridgeSpec{Vni: bridge.Spec.Vni, VlanId: bridge.Spec.VlanId}, Status: &pb.LogicalBridgeStatus{OperStatus: pb.LBOperStatus_LB_OPER_STATUS_UP}}, nil
+}
+
+// ListLogicalBridges lists logical bridges
+func (s *Server) ListLogicalBridges(_ context.Context, in *pb.ListLogicalBridgesRequest) (*pb.ListLogicalBridgesResponse, error) {
+	log.Printf("ListLogicalBridges: Received from client: %v", in)
+	// check required fields
+	if err := fieldbehavior.ValidateRequiredFields(in); err != nil {
+		log.Printf("error: %v", err)
+		return nil, err
+	}
+	// fetch pagination from the database, calculate size and offset
+	size, offset, perr := extractPagination(in.PageSize, in.PageToken, s.Pagination)
+	if perr != nil {
+		log.Printf("error: %v", perr)
+		return nil, perr
+	}
+	// fetch object from the database
+	Blobarray := []*pb.LogicalBridge{}
+	for _, bridge := range s.Bridges {
+		r := protoClone(bridge)
+		r.Status = &pb.LogicalBridgeStatus{OperStatus: pb.LBOperStatus_LB_OPER_STATUS_UP}
+		Blobarray = append(Blobarray, r)
+	}
+	// sort is needed, since MAP is unsorted in golang, and we might get different results
+	sortLogicalBridges(Blobarray)
+	log.Printf("Limiting result len(%d) to [%d:%d]", len(Blobarray), offset, size)
+	Blobarray, hasMoreElements := limitPagination(Blobarray, offset, size)
+	token := ""
+	if hasMoreElements {
+		token = uuid.New().String()
+		s.Pagination[token] = offset + size
+	}
+	return &pb.ListLogicalBridgesResponse{LogicalBridges: Blobarray, NextPageToken: token}, nil
 }
